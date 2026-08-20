@@ -7,7 +7,7 @@ app.use(express.json());
 // ---------- CONFIG ----------
 
 const MONDAY_API_URL = "https://api.monday.com/v2";
-const MONDAY_API_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjY5NDkwNTAzNCwiYWFpIjoxMSwidWlkIjoxMTE2OTc5MTUsImlhZCI6IjIwMjYtMDgtMTlUMTc6Mjg6MDQuMTg3WiIsInBlciI6Im1lOndyaXRlIiwiYWN0aWQiOjU0ODc4ODEsInJnbiI6InVzZTEifQ._yVmZexGCeAZCDNc2iE7YAE-RRyrNV1lPo4Udf3C40Y"; // set this in your env
+const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
 
 // Column IDs from your board (from the payload you shared)
 const STEP_COLUMN_ID = "color_mm6a6zwe";   // "Step" grouping column on subitems
