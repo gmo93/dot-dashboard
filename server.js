@@ -1,5 +1,6 @@
 const express = require("express");
 const fetch = require("node-fetch"); // npm i node-fetch@2
+const rateLimit = require("express-rate-limit"); // npm i express-rate-limit
 
 const app = express();
 app.use(express.json());
@@ -7,7 +8,21 @@ app.use(express.json());
 // ---------- CONFIG ----------
 
 const MONDAY_API_URL = "https://api.monday.com/v2";
-const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
+const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN; // set this in your env
+
+// Standard Monday board webhooks (create_webhook mutation) are NOT cryptographically
+// signed — that's only available if you build a full Monday app with a signing secret.
+// So instead, we protect this endpoint with a shared secret passed as a query param.
+// Generate a long random string (e.g. `openssl rand -hex 32`) and set it as an env var,
+// then register your webhook URL as: https://your-app.com/webhook?token=<that value>
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+
+if (!WEBHOOK_SECRET) {
+    console.warn(
+        "WARNING: WEBHOOK_SECRET is not set. Your /webhook endpoint is unprotected. " +
+        "Set WEBHOOK_SECRET in your environment and add ?token=<secret> to your Monday webhook URL."
+    );
+}
 
 // Column IDs from your board (from the payload you shared)
 const STEP_COLUMN_ID = "color_mm6a6zwe";   // "Step" grouping column on subitems
@@ -120,9 +135,44 @@ function determineTargetStep(groupedSubitems) {
     return "Complete";
 }
 
+// ---------- SECURITY MIDDLEWARE ----------
+
+// Basic rate limiter: caps requests per IP to blunt floods/abuse.
+// Generous enough not to interfere with legitimate rapid status changes.
+const webhookLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 60,             // 60 requests per minute per IP
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests" },
+});
+
+// Rejects any request whose ?token= doesn't match WEBHOOK_SECRET.
+// The Monday "challenge" verification ping also has to pass this check,
+// so make sure your registered webhook URL includes ?token=... from the start.
+function requireWebhookSecret(req, res, next) {
+    if (!WEBHOOK_SECRET) return next(); // no secret configured — warning already logged at startup
+
+    const provided = req.query.token;
+    if (provided !== WEBHOOK_SECRET) {
+        console.warn("Rejected webhook request: invalid or missing token.");
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+    next();
+}
+
+// Validates that the payload at least looks like a real Monday event before we act on it.
+function isValidMondayEvent(event) {
+    if (!event || typeof event !== "object") return false;
+    if (event.app !== "monday") return false;
+    if (typeof event.parentItemId !== "string" && typeof event.parentItemId !== "number") return false;
+    if (!/^\d+$/.test(String(event.parentItemId))) return false; // must look like a numeric Monday ID
+    return true;
+}
+
 // ---------- WEBHOOK ROUTE ----------
 
-app.post("/webhook", async (req, res) => {
+app.post("/webhook", webhookLimiter, requireWebhookSecret, async (req, res) => {
     const body = req.body;
 
     // Monday sends a one-time "challenge" request when you first register the webhook URL.
@@ -137,12 +187,13 @@ app.post("/webhook", async (req, res) => {
 
     try {
         const event = body.event ?? body; // handles both wrapped and raw event shapes
-        const parentItemId = event.parentItemId;
 
-        if (!parentItemId) {
-            console.log("No parentItemId on event, skipping:", event.pulseId);
+        if (!isValidMondayEvent(event)) {
+            console.warn("Rejected malformed/unexpected payload:", JSON.stringify(body).slice(0, 300));
             return;
         }
+
+        const parentItemId = event.parentItemId;
 
         const item = await fetchItemWithSubitems(parentItemId);
         if (!item) {
@@ -172,99 +223,17 @@ app.post("/webhook", async (req, res) => {
     }
 });
 
+// ---------- HEALTH CHECK ----------
+
+// Unprotected on purpose — safe to ping from an uptime monitor.
+// Keeps the /webhook path reserved for actual Monday traffic.
+app.get("/health", (req, res) => {
+    res.status(200).send("ok");
+});
+
 // ---------- START SERVER ----------
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Webhook server listening on port ${PORT}`);
 });
-
-// const express = require('express');
-// const fetch = require('node-fetch'); // npm install node-fetch@2
-// const app = express();
-// app.use(express.json());
-
-// // ---- Fill this in ----
-// const API_TOKEN = 'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjY5NDkwNTAzNCwiYWFpIjoxMSwidWlkIjoxMTE2OTc5MTUsImlhZCI6IjIwMjYtMDgtMTlUMTc6Mjg6MDQuMTg3WiIsInBlciI6Im1lOndyaXRlIiwiYWN0aWQiOjU0ODc4ODEsInJnbiI6InVzZTEifQ._yVmZexGCeAZCDNc2iE7YAE-RRyrNV1lPo4Udf3C40Y';
-// // -----------------------
-
-// async function mondayApi(query) {
-//     const res = await fetch('https://api.monday.com/v2', {
-//         method: 'POST',
-//         headers: {
-//             'Authorization': API_TOKEN,
-//             'Content-Type': 'application/json'
-//         },
-//         body: JSON.stringify({ query })
-//     });
-//     return res.json();
-// }
-
-// app.post('/webhook', async (req, res) => {
-//     // Handshake — required for monday.com to activate the webhook
-//     if (req.body.challenge) {
-//         return res.json({ challenge: req.body.challenge });
-//     }
-
-//     const event = req.body.event;
-
-//     // Ack immediately so monday.com doesn't retry/time out while we work
-//     res.status(200).send('ok');
-
-//     console.log('\n========== WEBHOOK RECEIVED ==========');
-//     console.log('Type:', event?.type);
-//     console.log('Raw event:\n', JSON.stringify(event, null, 2));
-//     console.log('=======================================\n');
-
-//     // Only bother querying monday.com if this looks like a subitem status change
-//     if (event?.type !== 'update_column_value') {
-//         console.log('Skipping API read — event type is not "update_column_value".\n');
-//         return;
-//     }
-
-//     const parentItemId = event.parentItemId;
-//     if (!parentItemId) {
-//         console.log('Skipping API read — no parentItemId on this event (likely not a subitem).\n');
-//         return;
-//     }
-
-//     // READ-ONLY query — pulls current group + all subitems + their column values
-//     const query = `
-//     query {
-//       items (ids: [${parentItemId}]) {
-//         id
-//         name
-//         group {
-//           id
-//           title
-//         }
-//         subitems {
-//           id
-//           name
-//           column_values {
-//             id
-//             text
-//             type
-//           }
-//         }
-//       }
-//     }
-//   `;
-
-//     try {
-//         const result = await mondayApi(query);
-
-//         if (result.errors) {
-//             console.log('API returned errors:\n', JSON.stringify(result.errors, null, 2));
-//             return;
-//         }
-
-//         console.log('---------- API READ RESULT ----------');
-//         console.log(JSON.stringify(result.data, null, 2));
-//         console.log('--------------------------------------\n');
-//     } catch (err) {
-//         console.error('API call failed:', err);
-//     }
-// });
-
-// app.listen(3000, () => console.log('listening on 3000'));
